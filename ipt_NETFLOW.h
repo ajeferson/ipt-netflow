@@ -275,8 +275,8 @@ struct ipt_netflow_tuple {
 #ifdef ENABLE_VLAN
 	__be16		tag[MAX_VLAN_TAGS]; // Network byte order (outer tag first)
 #endif
-	__u8		protocol;
 	__u8		tos;
+	__u8		protocol;
 	__u8		l3proto;
 #ifdef ENABLE_MAC
 	__u8		h_dst[ETH_ALEN];

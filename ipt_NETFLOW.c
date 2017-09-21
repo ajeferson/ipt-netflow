@@ -81,6 +81,7 @@
 #include "licensing.h"
 #include "base_templates.h"
 #include "helper.h"
+#include "protocols.h"
 
 #ifdef CONFIG_BRIDGE_NETFILTER
 # include <linux/netfilter_bridge.h>
@@ -556,6 +557,7 @@ static int nf_seq_show(struct seq_file *seq, void *v)
 {
 	unsigned int nr_flows = atomic_read(&ipt_netflow_count);
 	int cpu;
+	__u8 i;
 	struct ipt_netflow_stat t = { 0 };
 	struct ipt_netflow_sock *usock;
 #ifdef ENABLE_AGGR
@@ -836,7 +838,19 @@ static int nf_seq_show(struct seq_file *seq, void *v)
 		rcu_read_unlock();
 	}
 #endif
+
+	// Protocol stats
+	read_lock(&proto_stats_lock);
+
+	seq_printf(seq, "Statistics per Protocol\nProtocol        Packets        Bytes\n");
+	for(i = 0; i < PROTO_SIZE; i++) {
+		ProtocolStat p = proto_stats[i];
+		seq_printf(seq, "%6s %12d %12d\n", PROTO_NAME(p), p.packet_count, p.byte_count);
+	}
+	read_unlock(&proto_stats_lock);
+
 	return 0;
+
 }
 
 static int nf_seq_open(struct inode *inode, struct file *file)
@@ -4464,6 +4478,7 @@ static unsigned int netflow_target(
 	struct netflow_aggr_n *aggr_n;
 	struct netflow_aggr_p *aggr_p;
 #endif
+
 	__u8 s_mask, d_mask;
 	unsigned int ptr;
 	int fragment;
@@ -4471,6 +4486,7 @@ static unsigned int netflow_target(
 	int options = 0;
 	int tcpoptions = 0;
 	struct stripe_entry *stripe;
+	ProtocolStat *ps;
 
 	if (unlikely(
 #ifdef ENABLE_L2
@@ -4489,11 +4505,13 @@ static unsigned int netflow_target(
 
 	memset(&tuple, 0, sizeof(tuple));
 	tuple.l3proto = family;
+
 #ifdef ENABLE_PHYSDEV_OVER
 	if (skb->nf_bridge && skb->nf_bridge->physindev)
 		tuple.i_ifc = skb->nf_bridge->physindev->ifindex;
 	else /* FALLTHROUGH */
 #endif
+
 	tuple.i_ifc	= if_in? if_in->ifindex : -1;
 	tcp_flags	= 0;
 	s_mask		= 0;
@@ -4718,6 +4736,7 @@ do_protocols:
 #else /* !SAMPLING_HASH */
 	hash = hash_netflow(&tuple);
 #endif
+
 	read_lock(&htable_rwlock);
 	stripe = &htable_stripes[hash & LOCK_COUNT_MASK];
 	spin_lock(&stripe->lock);
@@ -4830,6 +4849,20 @@ do_protocols:
 	nf->options |= options;
 	if (tuple.protocol == IPPROTO_TCP)
 		nf->tcpoptions |= tcpoptions;
+
+	// Update protocol stats
+	write_lock(&proto_stats_lock);
+
+	ps = get_protocol_stat(tuple.protocol);
+	if(ps->packet_count == 0) { // First packet
+		ps->first_ts = jiffies;
+	}
+	ps->packet_count++;
+	ps->byte_count += pkt_len;
+	ps->last_ts = jiffies;
+
+	write_unlock(&proto_stats_lock);
+
 
 	NETFLOW_STAT_INC(pkt_total);
 	NETFLOW_STAT_ADD(traf_total, pkt_len);
@@ -5048,6 +5081,7 @@ static int register_stat(const char *name, struct file_operations *fops)
 #endif
 
 int init_module(void) {
+
 	int i;
 
 	printk(KERN_INFO "ipt_NETFLOW version %s, srcversion %s\n",
@@ -5104,6 +5138,9 @@ int init_module(void) {
 		printk(KERN_ERR "Unable to create ipt_netflow slab cache\n");
 		goto err_free_hash;
 	}
+
+	// TODO Check for alloc errors
+	alloc_protocol_stats();
 
 	if (!register_stat("ipt_netflow", &nf_seq_fops))
 		goto err_free_netflow_slab;
@@ -5196,6 +5233,7 @@ int init_module(void) {
 #endif
 
 	printk(KERN_INFO "ipt_NETFLOW is loaded.\n");
+
 	return 0;
 
 err_stop_timer:

@@ -1,0 +1,6 @@
+#! /bin/bash
+
+insmod ipt_NETFLOW.ko
+iptables -I INPUT -j NETFLOW
+iptables -I OUTPUT -j NETFLOW
+iptables -I FORWARD -j NETFLOW
