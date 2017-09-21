@@ -1,0 +1,14 @@
+.cproject
+.project
+modules.order
+.ipt_NETFLOW.ko.cmd
+.ipt_NETFLOW.mod.o.cmd
+.ipt_NETFLOW.o.cmd
+.tmp_versions/*
+Makefile
+Module.symvers
+*.ko
+*.mod.c
+*.mod.o
+*.o
+*.so

@@ -50,6 +50,7 @@
 #include <net/addrconf.h>
 #include <net/dst.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
+
 #ifndef ENABLE_NAT
 # undef CONFIG_NF_NAT_NEEDED
 #endif
@@ -75,143 +76,37 @@
 #include "compat.h"
 #include "ipt_NETFLOW.h"
 #include "murmur3.h"
+#include "templates.h"
+#include "module_inputs.h"
+#include "licensing.h"
+#include "base_templates.h"
+#include "helper.h"
+
 #ifdef CONFIG_BRIDGE_NETFILTER
 # include <linux/netfilter_bridge.h>
 #endif
+
 #ifdef CONFIG_SYSCTL
 # include <linux/sysctl.h>
 #endif
+
 #ifndef CONFIG_NF_CONNTRACK_EVENTS
 /* No conntrack events in the kernel imply no natevents. */
 # undef CONFIG_NF_NAT_NEEDED
 #endif
 
-#define IPT_NETFLOW_VERSION "2.2"   /* Note that if you are using git, you
-				       will see version in other format. */
-#include "version.h"
 #ifdef GITVERSION
 #undef IPT_NETFLOW_VERSION
 #define IPT_NETFLOW_VERSION GITVERSION
 #endif
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("<abc@telekom.ru>");
-MODULE_DESCRIPTION("iptables NETFLOW target module");
-MODULE_VERSION(IPT_NETFLOW_VERSION);
-MODULE_ALIAS("ip6t_NETFLOW");
-
+/**
+ * Version attributes
+ * */
 static char version_string[128];
 static int  version_string_size;
+
 static struct duration start_ts; /* ts of module start (ktime) */
-
-#define DST_SIZE 256
-static char destination_buf[DST_SIZE] = "127.0.0.1:2055";
-static char *destination = destination_buf;
-module_param(destination, charp, 0444);
-MODULE_PARM_DESC(destination, "export destination ipaddress:port");
-
-#ifdef ENABLE_SAMPLER
-static char sampler_buf[128] = "";
-static char *sampler = sampler_buf;
-module_param(sampler, charp, 0444);
-MODULE_PARM_DESC(sampler, "flow sampler parameters");
-static atomic_t flow_count = ATOMIC_INIT(0); /* flow counter for deterministic sampler */
-static atomic64_t flows_observed = ATOMIC_INIT(0);
-static atomic64_t flows_selected = ATOMIC_INIT(0);
-#define SAMPLER_INFO_INTERVAL (5*60)
-static unsigned long ts_sampler_last = 0; /* template send time (jiffies) */
-static struct duration sampling_ts; /* ts of sampling start (ktime) */
-#define SAMPLER_SHIFT       14
-#define SAMPLER_INTERVAL_M  ((1 << SAMPLER_SHIFT) - 1)
-enum {
-	SAMPLER_DETERMINISTIC = 1,
-	SAMPLER_RANDOM	      = 2,
-	SAMPLER_HASH	      = 3
-};
-struct sampling {
-	union {
-		u32		v32;
-		struct {
-			u8	mode;
-			u16 	interval;
-		};
-	};
-} samp;
-#endif
-
-static int inactive_timeout = 15;
-module_param(inactive_timeout, int, 0644);
-MODULE_PARM_DESC(inactive_timeout, "inactive flows timeout in seconds");
-
-static int active_timeout = 30 * 60;
-module_param(active_timeout, int, 0644);
-MODULE_PARM_DESC(active_timeout, "active flows timeout in seconds");
-
-static int exportcpu = -1;
-module_param(exportcpu, int, 0644);
-MODULE_PARM_DESC(exportcpu, "lock exporter to this cpu");
-
-#ifdef ENABLE_PROMISC
-static int promisc = 0;
-module_param(promisc, int, 0444);
-MODULE_PARM_DESC(promisc, "enable promisc hack (0=default, 1)");
-static DEFINE_MUTEX(promisc_lock);
-#endif
-
-static int debug = 0;
-module_param(debug, int, 0644);
-MODULE_PARM_DESC(debug, "debug verbosity level");
-
-static int sndbuf;
-module_param(sndbuf, int, 0444);
-MODULE_PARM_DESC(sndbuf, "udp socket SNDBUF size");
-
-static int protocol = 5;
-module_param(protocol, int, 0444);
-MODULE_PARM_DESC(protocol, "netflow protocol version (5, 9, 10=IPFIX)");
-
-static unsigned int refresh_rate = 20;
-module_param(refresh_rate, uint, 0644);
-MODULE_PARM_DESC(refresh_rate, "NetFlow v9/IPFIX refresh rate (packets)");
-
-static unsigned int timeout_rate = 30;
-module_param(timeout_rate, uint, 0644);
-MODULE_PARM_DESC(timeout_rate, "NetFlow v9/IPFIX timeout rate (minutes)");
-
-static int one = 1;
-static unsigned int scan_min = 1;
-static unsigned int scan_max = HZ / 10;
-module_param(scan_min, uint, 0644);
-MODULE_PARM_DESC(scan_min, "Minimal interval between export scans (jiffies)");
-
-#ifdef SNMP_RULES
-static char snmp_rules_buf[DST_SIZE] = "";
-static char *snmp_rules = snmp_rules_buf;
-module_param(snmp_rules, charp, 0444);
-MODULE_PARM_DESC(snmp_rules, "SNMP-index conversion rules");
-static unsigned char *snmp_ruleset;
-static DEFINE_SPINLOCK(snmp_lock);
-#endif
-
-#ifdef CONFIG_NF_NAT_NEEDED
-static int natevents = 0;
-module_param(natevents, int, 0444);
-MODULE_PARM_DESC(natevents, "enable NAT Events");
-#endif
-
-static int hashsize;
-module_param(hashsize, int, 0444);
-MODULE_PARM_DESC(hashsize, "hash table size");
-
-static int maxflows = 2000000;
-module_param(maxflows, int, 0644);
-MODULE_PARM_DESC(maxflows, "maximum number of flows");
-static int peakflows = 0;
-static unsigned long peakflows_at; /* jfffies */
-
-static int engine_id = 0;
-module_param(engine_id, int, 0644);
-MODULE_PARM_DESC(engine_id, "Observation Domain ID");
 
 #ifdef ENABLE_AGGR
 #define AGGR_SIZE 1024
@@ -232,14 +127,20 @@ static DEFINE_MUTEX(sock_lock);
 
 #define LOCK_COUNT (1<<8)
 #define LOCK_COUNT_MASK (LOCK_COUNT-1)
+
+/**
+ * Stripes
+ * */
 struct stripe_entry {
-	struct list_head list; /* struct ipt_netflow, list for export */
-	spinlock_t lock; /* this locks both: hash table stripe & list above */
+	struct list_head list;  									// struct ipt_netflow, list for export
+	spinlock_t lock; 											// this locks both: hash table stripe & list above
 };
-static struct stripe_entry htable_stripes[LOCK_COUNT];
-static DEFINE_RWLOCK(htable_rwlock); /* global rwlock to protect htable[] resize */
-static struct hlist_head *htable __read_mostly; /* hash table memory */
+static struct stripe_entry htable_stripes[LOCK_COUNT];  		// Holds the flows for export
+
+static DEFINE_RWLOCK(htable_rwlock); 							// global rwlock to protect htable[] resize
+static struct hlist_head *htable __read_mostly; 				// hash table memory
 static unsigned int htable_size __read_mostly = 0; /* buckets */
+
 /* How it's organized:
  *  htable_rwlock locks access to htable[hash], where
  *  htable[htable_size] is big/resizable hash table, which is striped into
@@ -249,25 +150,32 @@ static unsigned int htable_size __read_mostly = 0; /* buckets */
  *  hash to the htable[] is hash_netflow(&tuple) % htable_size
  *  hash to the htable_stripes[] is hash & LOCK_COUNT_MASK
  */
+
 #ifdef HAVE_LLIST
 static LLIST_HEAD(export_llist); /* flows to purge */
 #endif
+
 #ifdef CONFIG_NF_NAT_NEEDED
 static LIST_HEAD(nat_list); /* nat events */
 static DEFINE_SPINLOCK(nat_lock);
 static unsigned long nat_events_start = 0;
 static unsigned long nat_events_stop = 0;
 #endif
-static struct kmem_cache *ipt_netflow_cachep __read_mostly; /* ipt_netflow memory */
+
+static struct kmem_cache *ipt_netflow_cachep __read_mostly; 	// ipt_netflow memory
 static atomic_t ipt_netflow_count = ATOMIC_INIT(0);
 
-static long long pdu_packets = 0, pdu_traf = 0; /* how much accounted traffic in pdu */
+
+/**
+ * PDU
+ * */
+static long long pdu_packets = 0, pdu_traf = 0; 				// How much accounted traffic in PDU
 static unsigned int pdu_count = 0;
 static unsigned int pdu_seq = 0;
-static unsigned int pdu_data_records = 0; /* Data records */
-static unsigned int pdu_flow_records = 0; /* Data records with flows (for stat only) */
+static unsigned int pdu_data_records = 0; 						// Data records
+static unsigned int pdu_flow_records = 0; 						// Data records with flows (for stat only)
 static unsigned int pdu_tpl_records = 0;
-static unsigned long pdu_ts_mod; /* ts(jiffies) of last flow */
+static unsigned long pdu_ts_mod; 								// ts(jiffies) of last flow
 static unsigned int pdu_needs_export = 0;
 static union {
 	__be16 version;
@@ -276,12 +184,16 @@ static union {
 	struct ipfix_pdu ipfix;
 } pdu;
 static __u8 *pdu_data_used;
-static __u8 *pdu_high_wm; /* high watermark */
-static struct flowset_data *pdu_flowset = NULL; /* current data flowset */
+static __u8 *pdu_high_wm; 										// High Watermark
+static struct flowset_data *pdu_flowset = NULL; 				// Current data flowset
 
-static unsigned long wk_start; /* last start of worker (jiffies) */
-static unsigned long wk_busy;  /* last work busy time (jiffies) */
-static unsigned int wk_count;  /* how much is scanned */
+
+/**
+ * Worker Attributes
+ * */
+static unsigned long wk_start; 									// last start of worker (jiffies)
+static unsigned long wk_busy;  									// last work busy time (jiffies)
+static unsigned int wk_count;  									// how much is scanned
 static unsigned int wk_cpu;
 static unsigned int wk_trylock;
 static unsigned int wk_llist;
@@ -310,20 +222,24 @@ static int metric = METRIC_DFL,
 	   min5_metric = METRIC_DFL,
 	   min_metric = METRIC_DFL; /* hash metrics */
 
+
 static int set_hashsize(int new_size);
 static void destination_removeall(void);
 static int add_destinations(const char *ptr);
 static int netflow_scan_and_export(int flush);
+
 enum {
 	DONT_FLUSH, AND_FLUSH
 };
 static int template_ids = FLOWSET_DATA_FIRST;
-static int tpl_count = 0; /* how much active templates */
+static int tpl_count = 0; 										// How much active templates
+
 #define STAT_INTERVAL	 (1*60)
 #define SYSINFO_INTERVAL (5*60)
-static unsigned long ts_stat_last = 0; /* (jiffies) */
-static unsigned long ts_sysinf_last = 0; /* (jiffies) */
-static unsigned long ts_ifnames_last = 0; /* (jiffies) */
+
+static unsigned long ts_stat_last = 0;
+static unsigned long ts_sysinf_last = 0;
+static unsigned long ts_ifnames_last = 0;
 
 static inline __be32 bits2mask(int bits) {
 	return (bits? 0xffffffff << (32 - bits) : 0);
@@ -2802,360 +2718,6 @@ static u_int8_t tpl_element_sizes[] = {
 #define TEMPLATES_HASH_SIZE	(1<<TEMPLATES_HASH_BSIZE)
 static struct hlist_head templates_hash[TEMPLATES_HASH_SIZE];
 
-struct base_template {
-	int length; /* number of elements in template */
-	u_int16_t types[]; /* {type, size} pairs */
-};
-
-/* Data Templates */
-#define BTPL_BASE9	0x00000001	/* netflow base stat */
-#define BTPL_BASEIPFIX	0x00000002	/* ipfix base stat */
-#define BTPL_IP4	0x00000004	/* IPv4 */
-#define BTPL_MASK4	0x00000008	/* Aggregated */
-#define BTPL_PORTS	0x00000010	/* UDP&TCP */
-#define BTPL_IP6	0x00000020	/* IPv6 */
-#define BTPL_ICMP9	0x00000040	/* ICMP (for V9) */
-#define BTPL_ICMPX4	0x00000080	/* ICMP IPv4 (for IPFIX) */
-#define BTPL_ICMPX6	0x00000100	/* ICMP IPv6 (for IPFIX) */
-#define BTPL_IGMP	0x00000200	/* IGMP */
-#define BTPL_IPSEC	0x00000400	/* AH&ESP */
-#define BTPL_NAT4	0x00000800	/* NAT IPv4 */
-#define BTPL_LABEL6	0x00001000	/* IPv6 flow label */
-#define BTPL_IP4OPTIONS	0x00002000	/* IPv4 Options */
-#define BTPL_IP6OPTIONS	0x00004000	/* IPv6 Options */
-#define BTPL_TCPOPTIONS	0x00008000	/* TCP Options */
-#define BTPL_MAC	0x00010000	/* MAC addresses */
-#define BTPL_VLAN9	0x00020000	/* outer VLAN for v9 */
-#define BTPL_VLANX	0x00040000	/* outer VLAN for IPFIX */
-#define BTPL_VLANI	0x00080000	/* inner VLAN (IPFIX) */
-#define BTPL_ETHERTYPE	0x00100000	/* ethernetType */
-#define BTPL_DIRECTION	0x00200000	/* flowDirection */
-#define BTPL_SAMPLERID	0x00400000	/* samplerId (v9) */
-#define BTPL_SELECTORID	0x00800000	/* selectorId (IPFIX) */
-#define BTPL_MPLS	0x01000000	/* MPLS stack */
-#define BTPL_OPTION	0x80000000	/* Options Template */
-#define BTPL_MAX	32
-/* Options Templates */
-#define OTPL(x) (BTPL_OPTION | x)
-#define OTPL_SYSITIME	OTPL(1)		/* systemInitTimeMilliseconds */
-#define OTPL_MPSTAT	OTPL(2)		/* The Metering Process Statistics (rfc5101) */
-#define OTPL_MPRSTAT	OTPL(3)		/* The Metering Process Reliability Statistics */
-#define OTPL_EPRSTAT	OTPL(4)		/* The Exporting Process Reliability Statistics */
-#define OTPL_SAMPLER	OTPL(5)		/* Flow Sampler for v9 */
-#define OTPL_SEL_RAND	OTPL(6)		/* Random Flow Selector for IPFIX */
-#define OTPL_SEL_COUNT	OTPL(7)		/* Systematic count-based Flow Selector for IPFIX */
-#define OTPL_SEL_STAT	OTPL(8)		/* rfc7014 */
-#define OTPL_SEL_STATH	OTPL(9)		/* OTPL_SEL_STAT, except selectorIDTotalFlowsObserved */
-#define OTPL_IFNAMES	OTPL(10)
-
-static struct base_template template_base_9 = {
-	.types = {
-		INPUT_SNMP,
-		OUTPUT_SNMP,
-#ifdef ENABLE_PHYSDEV
-		ingressPhysicalInterface,
-		egressPhysicalInterface,
-#endif
-		IN_PKTS,
-		IN_BYTES,
-		FIRST_SWITCHED,
-		LAST_SWITCHED,
-		PROTOCOL,
-		TOS,
-		0
-	}
-};
-static struct base_template template_base_ipfix = {
-	.types = {
-		ingressInterface,
-		egressInterface,
-#ifdef ENABLE_PHYSDEV
-		ingressPhysicalInterface,
-		egressPhysicalInterface,
-#endif
-		packetDeltaCount,
-		octetDeltaCount,
-		flowStartMilliseconds,
-		flowEndMilliseconds,
-		protocolIdentifier,
-		ipClassOfService,
-		flowEndReason,
-		0
-	}
-};
-#ifdef ENABLE_MAC
-static struct base_template template_mac_ipfix = {
-	.types = {
-		destinationMacAddress,
-		sourceMacAddress,
-		0
-	}
-};
-#endif
-#if defined(ENABLE_MAC) || defined(ENABLE_VLAN)
-static struct base_template template_ethertype = {
-	.types = { ethernetType, 0 }
-};
-#endif
-#ifdef ENABLE_VLAN
-static struct base_template template_vlan_v9 = {
-	.types = { SRC_VLAN, 0 }
-};
-/* IPFIX is different from v9, see rfc7133. */
-static struct base_template template_vlan_ipfix = {
-	.types = {
-		dot1qVlanId,
-		dot1qPriority,
-		0
-	}
-};
-static struct base_template template_vlan_inner = {
-	.types = {
-		dot1qCustomerVlanId,
-		dot1qCustomerPriority,
-		0
-	}
-};
-#endif
-#ifdef MPLS_DEPTH
-static struct base_template template_mpls = {
-	.types = {
-		mplsTopLabelTTL,
-		/* do not just add element here, becasue this array
-		 * is truncated in ipt_netflow_init() */
-#define MPLS_LABELS_BASE_INDEX 1
-		MPLS_LABEL_1,
-		MPLS_LABEL_2,
-		MPLS_LABEL_3,
-		MPLS_LABEL_4,
-		MPLS_LABEL_5,
-		MPLS_LABEL_6,
-		MPLS_LABEL_7,
-		MPLS_LABEL_8,
-		MPLS_LABEL_9,
-		MPLS_LABEL_10,
-		0
-	}
-};
-#endif
-#ifdef ENABLE_DIRECTION
-static struct base_template template_direction = {
-	.types = { DIRECTION, 0 }
-};
-#endif
-static struct base_template template_ipv4 = {
-	.types = {
-		IPV4_SRC_ADDR,
-		IPV4_DST_ADDR,
-		IPV4_NEXT_HOP,
-		0
-	}
-};
-static struct base_template template_options4 = {
-	.types = { ipv4Options, 0 }
-};
-static struct base_template template_tcpoptions = {
-	.types = { tcpOptions, 0 }
-};
-static struct base_template template_ipv6 = {
-	.types = {
-		IPV6_SRC_ADDR,
-		IPV6_DST_ADDR,
-		IPV6_NEXT_HOP,
-		0
-	}
-};
-static struct base_template template_options6 = {
-	.types = { IPV6_OPTION_HEADERS, 0 }
-};
-static struct base_template template_label6 = {
-	.types = { IPV6_FLOW_LABEL, 0 }
-};
-static struct base_template template_ipv4_mask = {
-	.types = {
-		SRC_MASK,
-		DST_MASK,
-		0
-	}
-};
-static struct base_template template_ports = {
-	.types = {
-		L4_SRC_PORT,
-		L4_DST_PORT,
-		TCP_FLAGS,
-		0
-	}
-};
-static struct base_template template_icmp_v9 = {
-	.types = {
-		L4_SRC_PORT,	/* dummy (required by some collector(s) to
-				   recognize ICMP flows) */
-		L4_DST_PORT,	/* actually used in V9 world instead of
-				   ICMP_TYPE(32), disregarding docs */
-		0
-	}
-};
-static struct base_template template_icmp_ipv4 = {
-	.types = { icmpTypeCodeIPv4, 0 }
-};
-static struct base_template template_icmp_ipv6 = {
-	.types = { icmpTypeCodeIPv6, 0 }
-};
-static struct base_template template_igmp = {
-	.types = { MUL_IGMP_TYPE, 0 }
-};
-static struct base_template template_ipsec = {
-	.types = { IPSecSPI, 0 }
-};
-static struct base_template template_nat4 = {
-	.types = {
-		observationTimeMilliseconds,
-		IPV4_SRC_ADDR,
-		IPV4_DST_ADDR,
-		postNATSourceIPv4Address,
-		postNATDestinationIPv4Address,
-		L4_SRC_PORT,
-		L4_DST_PORT,
-		postNAPTSourceTransportPort,
-		postNAPTDestinationTransportPort,
-		PROTOCOL,
-		natEvent,
-		0
-	}
-};
-
-static struct base_template template_sys_init_time = {
-	.types = {
-		observationDomainId,
-
-		/* ipfix does not report sys_uptime_ms like v9 does,
-		 * so this could be useful to detect system restart
-		 * (rfc5102), and conversion of flow times to absolute
-		 * time (rfc5153 4.7) */
-		systemInitTimeMilliseconds,
-
-		/* this will let collector detect module version and
-		 * recompilation (by srcversion) */
-		observationDomainName,
-
-		/* useful to detect module reload */
-		flowStartMilliseconds,
-		flowEndMilliseconds,
-		0
-	}
-};
-
-/* http://tools.ietf.org/html/rfc5101#section-4 */
-/* The Metering Process Statistics Option Template */
-static struct base_template template_meter_stat = {
-	.types = {
-		observationDomainId,
-		exportedMessageTotalCount,
-		exportedFlowRecordTotalCount,
-		exportedOctetTotalCount,
-		observedFlowTotalCount,
-		0
-	}
-};
-/* The Metering Process Reliability Statistics Option Template */
-static struct base_template template_meter_rel_stat = {
-	.types = {
-		observationDomainId,
-		ignoredPacketTotalCount,
-		ignoredOctetTotalCount,
-		flowStartMilliseconds, /* sampling start time */
-		flowEndMilliseconds,
-		0
-	}
-};
-/* The Exporting Process Reliability Statistics Option Template */
-static struct base_template template_exp_rel_stat = {
-	.types = {
-		exportingProcessId,
-		notSentFlowTotalCount,
-		notSentPacketTotalCount,
-		notSentOctetTotalCount,
-		flowStartMilliseconds, /* sampling start time */
-		flowEndMilliseconds,
-		0
-	}
-};
-
-#ifdef ENABLE_SAMPLER
-static struct base_template template_samplerid = {
-	.types = { FLOW_SAMPLER_ID, 0 }
-};
-static struct base_template template_selectorid = {
-	.types = { selectorId, 0 }
-};
-
-/* sampler for v9 */
-static struct base_template template_sampler = {
-	.types = {
-		observationDomainId,
-		FLOW_SAMPLER_ID,
-		FLOW_SAMPLER_MODE,
-		FLOW_SAMPLER_RANDOM_INTERVAL,
-		0
-	}
-};
-/* sampler for ipfix */
-static struct base_template template_selector_systematic = {
-	.types = {
-		observationDomainId,
-		selectorId,
-		flowSelectorAlgorithm,
-		samplingFlowInterval,
-		samplingFlowSpacing,
-		0
-	}
-};
-static struct base_template template_selector_random = {
-	.types = {
-		observationDomainId,
-		selectorId,
-		flowSelectorAlgorithm,
-		samplingSize,
-		samplingPopulation,
-		0
-	}
-};
-static struct base_template template_selector_stat = {
-	.types = {
-		selectorId,
-		selectorIDTotalFlowsObserved,
-		selectorIDTotalFlowsSelected,
-		selectorIdTotalPktsObserved,
-		selectorIdTotalPktsSelected,
-		flowStartMilliseconds,
-		flowEndMilliseconds,
-		0
-	}
-};
-/* can't calc selectorIDTotalFlowsObserved for hash sampling,
- * because dropped flows are not accounted */
-static struct base_template template_selector_stat_hash = {
-	.types = {
-		selectorId,
-		selectorIDTotalFlowsSelected,
-		selectorIdTotalPktsObserved,
-		selectorIdTotalPktsSelected,
-		flowStartMilliseconds,
-		flowEndMilliseconds,
-		0
-	}
-};
-#endif
-
-static struct base_template template_interfaces = {
-	.types = {
-		observationDomainId,
-		INPUT_SNMP,
-		IF_NAME,
-		IF_DESC,
-		0
-	}
-};
 
 struct data_template {
 	struct hlist_node hlist;
@@ -5485,8 +5047,7 @@ static int register_stat(const char *name, struct file_operations *fops)
 # define register_stat(x, y) 1
 #endif
 
-static int __init ipt_netflow_init(void)
-{
+int init_module(void) {
 	int i;
 
 	printk(KERN_INFO "ipt_NETFLOW version %s, srcversion %s\n",
@@ -5668,8 +5229,8 @@ err:
 	return -ENOMEM;
 }
 
-static void __exit ipt_netflow_fini(void)
-{
+void cleanup_module(void) {
+
 	printk(KERN_INFO "ipt_NETFLOW unloading..\n");
 
 #ifdef CONFIG_SYSCTL
@@ -5710,7 +5271,3 @@ static void __exit ipt_netflow_fini(void)
 	printk(KERN_INFO "ipt_NETFLOW unloaded.\n");
 }
 
-module_init(ipt_netflow_init);
-module_exit(ipt_netflow_fini);
-
-/* vim: set sw=8: */
