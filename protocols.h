@@ -26,8 +26,7 @@ typedef struct {
 	unsigned long int last_ts;
 } ProtocolStat;
 
-#define PROTO_HSIZE 10
-#define PROTO_NAME(p) 1
+#define PROTO_HSIZE 23				// Based on empiric heuristics to avoid collisions
 #define PROTO_UNKNOWN 0
 
 const char proto_unknown_name[6] = "Other";
