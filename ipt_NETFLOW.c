@@ -242,18 +242,6 @@ static unsigned long ts_stat_last = 0;
 static unsigned long ts_sysinf_last = 0;
 static unsigned long ts_ifnames_last = 0;
 
-static inline __be32 bits2mask(int bits) {
-	return (bits? 0xffffffff << (32 - bits) : 0);
-}
-
-static inline int mask2bits(__be32 mask) {
-	int n;
-
-	for (n = 0; mask; n++)
-		mask = (mask << 1) & 0xffffffff;
-	return n;
-}
-
 /* under that lock worker is always stopped and not rescheduled,
  * and we can call worker sub-functions manually */
 static DEFINE_MUTEX(worker_lock);
@@ -553,13 +541,14 @@ static int snmp_seq_show(struct seq_file *seq, void *v)
 }
 
 /* procfs statistics /proc/net/stat/ipt_netflow */
-static int nf_seq_show(struct seq_file *seq, void *v)
-{
+static int nf_seq_show(struct seq_file *seq, void *v) {
+
 	unsigned int nr_flows = atomic_read(&ipt_netflow_count);
-	int cpu;
-	__u8 i;
+	int cpu, i;
 	struct ipt_netflow_stat t = { 0 };
 	struct ipt_netflow_sock *usock;
+	ProtocolStat *curr, *aggr;
+
 #ifdef ENABLE_AGGR
 	struct netflow_aggr_n *aggr_n;
 	struct netflow_aggr_p *aggr_p;
@@ -839,14 +828,28 @@ static int nf_seq_show(struct seq_file *seq, void *v)
 	}
 #endif
 
-	// Protocol stats
+	// seq: proto_stats
 	read_lock(&proto_stats_lock);
+	aggr = alloc_protocol_stat(0);
 
-	seq_printf(seq, "Statistics per Protocol\nProtocol        Packets        Bytes\n");
-	for(i = 0; i < PROTO_SIZE; i++) {
-		ProtocolStat p = proto_stats[i];
-		seq_printf(seq, "%6s %12d %12d\n", PROTO_NAME(p), p.packet_count, p.byte_count);
+	seq_printf(seq, "---------- Statistics per Protocol ----------\nProtocol        Packets        Bytes\n");
+
+	for(i = 0; i < PROTO_HSIZE; i++) {
+		hlist_for_each_entry(curr, &proto_htable[i], hlist) {
+			if(is_proto_known(curr)) {
+				seq_printf(seq, "%8s %14d %12d\n", curr->name, curr->packet_count, curr->byte_count);
+			} else {
+				aggreage_proto_stats(aggr, curr);
+			}
+		}
 	}
+
+	if(aggr->packet_count > 0) {
+		seq_printf(seq, "%8s %14d %12d\n", aggr->name, aggr->packet_count, aggr->byte_count);
+	}
+
+	kfree(aggr);
+
 	read_unlock(&proto_stats_lock);
 
 	return 0;
@@ -1034,7 +1037,7 @@ static int flows_dump_seq_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "%d %04x %x",
 	    st->pcache,
 	    hash_netflow(&nf->tuple),
-	    (!!inactive_needs_export(nf, i_timeout, jiffies)) | 
+	    (!!inactive_needs_export(nf, i_timeout, jiffies)) |
 	    (active_needs_export(nf, a_timeout, jiffies) << 1));
 	seq_printf(seq, " %hd,%hd",
 	    nf->tuple.i_ifc,
@@ -2441,22 +2444,6 @@ ipt_netflow_find(const struct ipt_netflow_tuple *tuple, const unsigned int hash)
 	}
 	NETFLOW_STAT_INC(notfound);
 	return NULL;
-}
-
-static struct hlist_head *alloc_hashtable(const int size)
-{
-	struct hlist_head *hash;
-
-	hash = vmalloc(sizeof(struct hlist_head) * size);
-	if (hash) {
-		int i;
-
-		for (i = 0; i < size; i++)
-			INIT_HLIST_HEAD(&hash[i]);
-	} else
-		printk(KERN_ERR "ipt_NETFLOW: unable to vmalloc hash table.\n");
-
-	return hash;
 }
 
 static int set_hashsize(int new_size)
@@ -4420,7 +4407,10 @@ static void parse_l2_header(const struct sk_buff *skb, struct ipt_netflow_tuple 
 #endif /* defined(ENABLE_MAC) || defined(ENABLE_VLAN) || defined(MPLS_DEPTH) */
 }
 
-/* packet receiver */
+
+/**
+ * Packet receiver "delegate"
+ * */
 static unsigned int netflow_target(
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
 			   struct sk_buff **pskb,
@@ -4853,7 +4843,12 @@ do_protocols:
 	// Update protocol stats
 	write_lock(&proto_stats_lock);
 
-	ps = get_protocol_stat(tuple.protocol);
+	ps = find_protocol_stat(tuple.protocol);
+	if(!ps) {
+		ps = alloc_protocol_stat(tuple.protocol);
+		proto_htable_add(ps);
+	}
+
 	if(ps->packet_count == 0) { // First packet
 		ps->first_ts = jiffies;
 	}
@@ -5082,7 +5077,7 @@ static int register_stat(const char *name, struct file_operations *fops)
 
 int init_module(void) {
 
-	int i;
+	int i, ap;
 
 	printk(KERN_INFO "ipt_NETFLOW version %s, srcversion %s\n",
 		IPT_NETFLOW_VERSION, THIS_MODULE->srcversion);
@@ -5114,6 +5109,15 @@ int init_module(void) {
 		goto err;
 	}
 
+	// Alloc protocol hash table stats
+	ap = alloc_protocol_stats_hashtable();
+	if(ap) {
+		printk(KERN_INFO "ipt_NETFLOW: created hash table for protocol stats\n");
+	} else {
+		printk(KERN_ERR "Unable to create the protocols hash table\n");
+		goto err;
+	}
+
 #ifdef MPLS_DEPTH
 	/* template_mpls is terminated on the MPLS_DEPTH mark, so, it
 	 * never send Element which can access mpls labels array above
@@ -5139,8 +5143,6 @@ int init_module(void) {
 		goto err_free_hash;
 	}
 
-	// TODO Check for alloc errors
-	alloc_protocol_stats();
 
 	if (!register_stat("ipt_netflow", &nf_seq_fops))
 		goto err_free_netflow_slab;
@@ -5305,6 +5307,8 @@ void cleanup_module(void) {
 
 	kmem_cache_destroy(ipt_netflow_cachep);
 	vfree(htable);
+
+	free_proto_stats();
 
 	printk(KERN_INFO "ipt_NETFLOW unloaded.\n");
 }

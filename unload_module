@@ -1,4 +1,4 @@
 #! /bin/bash
 
 iptables -F
-rmmod ipt_NETFLOW
+rmmod -f ipt_NETFLOW
