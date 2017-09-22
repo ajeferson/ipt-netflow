@@ -10,6 +10,11 @@
 
 #include <linux/module.h>
 
+static inline int ABS(int x) { return x >= 0 ? x : -x; }
+#define SAFEDIV(x,y) ((y)? ({ u64 __tmp = x; do_div(__tmp, y); (int)__tmp; }) : 0)
+#define FFLOAT(x, prec) (int)(x) / prec, ABS((int)(x) % prec)
+#define DIVISION(x, y) FFLOAT(SAFEDIV(100LL * x, y), 100)
+
 static inline __be32 bits2mask(int bits) {
 	return (bits? 0xffffffff << (32 - bits) : 0);
 }

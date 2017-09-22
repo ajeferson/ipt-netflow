@@ -28,6 +28,7 @@ typedef struct {
 
 #define PROTO_HSIZE 23				// Based on empiric heuristics to avoid collisions
 #define PROTO_UNKNOWN 0
+#define BYTES_PER_PACKET(ps) DIVISION(ps->byte_count, ps->packet_count)
 
 const char proto_unknown_name[6] = "Other";
 
@@ -48,6 +49,7 @@ static char* get_protocol_name(__u8 protocol);
 static void free_proto_stats(void);
 static int is_proto_known(ProtocolStat *ps);
 static void aggreage_proto_stats(ProtocolStat *a, ProtocolStat *b);
+//static float bytes_per_packet(ProtocolStat *ps);
 
 
 /**
@@ -87,6 +89,10 @@ static ProtocolStat* find_protocol_stat(__u8 protocol) {
 	}
 	return NULL;
 }
+
+//static int bytes_per_packet(ProtocolStat *ps) {
+//	return (float) ps->byte_count / (float) ps->packet_count;
+//}
 
 static char* get_protocol_name(__u8 protocol) {
 	char *protocol_name = (char *) kmalloc(sizeof(char) * 1000, GFP_ATOMIC);

@@ -50,6 +50,7 @@
 #include <net/addrconf.h>
 #include <net/dst.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
+#include <linux/math64.h>
 
 #ifndef ENABLE_NAT
 # undef CONFIG_NF_NAT_NEEDED
@@ -411,9 +412,6 @@ static char *print_usock_addr(struct ipt_netflow_sock *usock)
 }
 
 #ifdef CONFIG_PROC_FS
-static inline int ABS(int x) { return x >= 0 ? x : -x; }
-#define SAFEDIV(x,y) ((y)? ({ u64 __tmp = x; do_div(__tmp, y); (int)__tmp; }) : 0)
-#define FFLOAT(x, prec) (int)(x) / prec, ABS((int)(x) % prec)
 static int snmp_seq_show(struct seq_file *seq, void *v)
 {
 	int cpu;
@@ -472,7 +470,7 @@ static int snmp_seq_show(struct seq_file *seq, void *v)
 	    t.notfound,
 	    t.pkt_total,
 	    t.traf_total,
-	    FFLOAT(SAFEDIV(100LL * (t.searched + t.found + t.notfound), (t.found + t.notfound)), 100),
+	    DIVISION(t.searched + t.found + t.notfound, t.found + t.notfound),
 	    (unsigned long)nr_flows * sizeof(struct ipt_netflow) +
 		   (unsigned long)htable_size * sizeof(struct hlist_head),
 	    nr_flows,
@@ -832,12 +830,12 @@ static int nf_seq_show(struct seq_file *seq, void *v) {
 	read_lock(&proto_stats_lock);
 	aggr = alloc_protocol_stat(0);
 
-	seq_printf(seq, "---------- Statistics per Protocol ----------\nProtocol        Packets        Bytes\n");
+	seq_printf(seq, "---------- Statistics per Protocol ----------\nProtocol        Packets        Bytes        Bytes/Pkt\n");
 
 	for(i = 0; i < PROTO_HSIZE; i++) {
 		hlist_for_each_entry(curr, &proto_htable[i], hlist) {
 			if(is_proto_known(curr)) {
-				seq_printf(seq, "%8s %14d %12d\n", curr->name, curr->packet_count, curr->byte_count);
+				seq_printf(seq, "%8s %14d %12d %13d.%02d\n", curr->name, curr->packet_count, curr->byte_count, BYTES_PER_PACKET(curr));
 			} else {
 				aggreage_proto_stats(aggr, curr);
 			}
@@ -845,7 +843,7 @@ static int nf_seq_show(struct seq_file *seq, void *v) {
 	}
 
 	if(aggr->packet_count > 0) {
-		seq_printf(seq, "%8s %14d %12d\n", aggr->name, aggr->packet_count, aggr->byte_count);
+		seq_printf(seq, "%8s %14d %12d %13d.%02d\n", aggr->name, aggr->packet_count, aggr->byte_count, BYTES_PER_PACKET(curr));
 	}
 
 	kfree(aggr);
@@ -4448,22 +4446,30 @@ static unsigned int netflow_target(
 # endif
 		struct sk_buff *skb = *pskb;
 #endif
+
 	union {
 		struct iphdr ip;
 		struct ipv6hdr ip6;
 	} _iph, *iph;
 	u_int32_t hash;
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,28)
+
 	const int family = target->family;
+
 #else
 # ifdef ENABLE_DIRECTION
 	const int hooknum = xt_hooknum(par);
 # endif
+
 	const int family = xt_family(par);
+
 #endif
+
 	struct ipt_netflow_tuple tuple;
 	struct ipt_netflow *nf;
 	__u8 tcp_flags;
+
 #ifdef ENABLE_AGGR
 	struct netflow_aggr_n *aggr_n;
 	struct netflow_aggr_p *aggr_p;

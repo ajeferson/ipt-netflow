@@ -1,1 +1,1 @@
-#define GITVERSION "2.2-25-gc7d7d4c-dirty"
+#define GITVERSION "2.2-27-g0dd3b6d-dirty"
